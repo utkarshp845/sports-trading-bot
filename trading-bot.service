@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi NBA Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-bot
+EnvironmentFile=/home/ubuntu/trading-bot/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/trading-bot/bot.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

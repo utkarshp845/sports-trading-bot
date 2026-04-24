@@ -1,0 +1,54 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync code to EC2
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.env' \
+            --exclude 'trades.db' \
+            --exclude '__pycache__' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/ubuntu/trading-bot/
+
+      - name: Install deps, write .env, restart service
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+
+            # Write .env (overwrite on every deploy)
+            cat > /home/ubuntu/trading-bot/.env << ENVEOF
+          KALSHI_API_KEY=${{ secrets.KALSHI_API_KEY }}
+          ODDS_API_KEY=${{ secrets.ODDS_API_KEY }}
+          ENVEOF
+
+            # Install Python deps
+            pip3 install -q -r /home/ubuntu/trading-bot/requirements.txt
+
+            # Install/update systemd service
+            sudo cp /home/ubuntu/trading-bot/trading-bot.service /etc/systemd/system/trading-bot.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable trading-bot
+            sudo systemctl restart trading-bot
+
+            echo "Service status:"
+            sudo systemctl status trading-bot --no-pager -l
+          EOF
