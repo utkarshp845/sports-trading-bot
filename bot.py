@@ -365,7 +365,13 @@ def run():
     kalshi = KalshiClient()
     odds_feed = OddsFeed()
 
-    balance = kalshi.get_balance()
+    try:
+        balance = kalshi.get_balance()
+    except Exception as e:
+        log.critical("Cannot reach Kalshi API at startup: %s", e)
+        log.critical("Check that KALSHI_API_KEY is set correctly in .env")
+        raise SystemExit(1)
+
     _session_start_balance = get_or_create_daily_start_balance(balance)
     _traded_tickers = load_today_traded_tickers()
     current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
