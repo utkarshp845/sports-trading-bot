@@ -11,6 +11,7 @@ Core idea:
 
 from __future__ import annotations
 
+import math
 import re
 import config
 
@@ -79,10 +80,11 @@ def parse_team_from_title(title: str) -> str | None:
             if mapped:
                 return mapped
 
-    # Direct alias scan (longest match first to avoid "heat" matching "charlotte")
-    for alias in sorted(_ALIASES, key=len, reverse=True):
-        if alias in low:
-            return _ALIASES[alias]
+    teams = parse_teams_from_text(low)
+    if len(teams) == 1:
+        return teams[0]
+    if teams:
+        return teams[0]
 
     return None
 
@@ -96,6 +98,22 @@ def _resolve(text: str) -> str | None:
     return _ALIASES.get(last)
 
 
+def parse_teams_from_text(text: str) -> list[str]:
+    """Return canonical NBA teams mentioned in text, preserving first mention order."""
+    low = text.lower()
+    matches: list[tuple[int, int, str]] = []
+    for alias, team in _ALIASES.items():
+        pattern = rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
+        for match in re.finditer(pattern, low):
+            matches.append((match.start(), -len(alias), team))
+
+    teams: list[str] = []
+    for _, _, team in sorted(matches):
+        if team not in teams:
+            teams.append(team)
+    return teams
+
+
 # ── Edge & sizing ─────────────────────────────────────────────────────────────
 
 def break_even_prob(price_cents: int) -> float:
@@ -103,6 +121,8 @@ def break_even_prob(price_cents: int) -> float:
     Minimum true probability needed to profit buying at price_cents,
     accounting for Kalshi fee on winnings.
     """
+    if price_cents <= 0 or price_cents >= 100:
+        raise ValueError("price_cents must be between 1 and 99")
     p = price_cents / 100
     fee = config.KALSHI_FEE_RATE
     # Net profit if win = (1-p)*(1-fee); loss if lose = p
@@ -125,6 +145,13 @@ def kelly_contracts(
     Return number of contracts to buy, using fractional Kelly capped at MAX_BET_FRACTION.
     Returns 0 if below minimum bet size.
     """
+    if bankroll <= 0 or true_prob <= 0 or true_prob >= 1:
+        return 0
+
+    price_cents = _coerce_price(price_cents)
+    if price_cents is None:
+        return 0
+
     p = price_cents / 100
     fee = config.KALSHI_FEE_RATE
     b = (1 - p) * (1 - fee) / p  # net odds per dollar risked
@@ -140,7 +167,7 @@ def kelly_contracts(
     if dollar_bet < config.MIN_BET_DOLLARS:
         return 0
 
-    contracts = int(dollar_bet / p)
+    contracts = math.floor(dollar_bet / p)
     return max(contracts, 0)
 
 
@@ -156,52 +183,110 @@ def find_edge(
     Caller must pass bankroll separately via kelly_contracts.
     """
     title = market.get("title", "")
-    yes_ask = market.get("yes_ask")   # cents: what you pay to buy YES
-    no_ask = market.get("no_ask")     # cents: what you pay to buy NO
+    subtitle = market.get("subtitle", "")
+    market_text = f"{title} {subtitle}"
+    yes_ask = _coerce_price(market.get("yes_ask"))   # cents: what you pay to buy YES
+    no_ask = _coerce_price(market.get("no_ask"))     # cents: what you pay to buy NO
 
-    if yes_ask is None or no_ask is None:
-        return None
-    if yes_ask <= 0 or yes_ask >= 100:
-        return None
-
-    yes_team = parse_team_from_title(title)
+    yes_team = parse_team_from_title(market_text)
     if not yes_team:
         return None
 
-    # Find the matching true probability for yes_team
-    yes_true = None
-    for team, prob in true_probs.items():
-        if team.lower() == yes_team.lower():
-            yes_true = prob
-            break
+    if not _market_matches_game(market_text, true_probs):
+        return None
+
+    yes_true = _team_probability(true_probs, yes_team)
     if yes_true is None:
         return None
 
     no_true = 1 - yes_true
 
-    yes_edge = compute_edge(yes_true, yes_ask)
-    no_edge = compute_edge(no_true, no_ask)
+    candidates = []
+    yes_signal = _build_signal(market, title, "yes", yes_team, yes_true, yes_ask)
+    if yes_signal:
+        candidates.append(yes_signal)
 
-    if yes_edge >= config.EDGE_THRESHOLD:
-        return {
-            "ticker": market["ticker"],
-            "side": "yes",
-            "price_cents": yes_ask,
-            "true_prob": yes_true,
-            "edge": yes_edge,
-            "team": yes_team,
-            "title": title,
-        }
-    if no_edge >= config.EDGE_THRESHOLD:
-        no_team = next((t for t in true_probs if t.lower() != yes_team.lower()), "opponent")
-        return {
-            "ticker": market["ticker"],
-            "side": "no",
-            "price_cents": no_ask,
-            "true_prob": no_true,
-            "edge": no_edge,
-            "team": no_team,
-            "title": title,
-        }
+    no_team = next((t for t in true_probs if t.lower() != yes_team.lower()), "opponent")
+    no_signal = _build_signal(market, title, "no", no_team, no_true, no_ask)
+    if no_signal:
+        candidates.append(no_signal)
+
+    if candidates:
+        return max(candidates, key=lambda signal: signal["edge"])
 
     return None
+
+
+def _build_signal(
+    market: dict,
+    title: str,
+    side: str,
+    team: str,
+    true_prob: float,
+    price_cents: int | None,
+) -> dict | None:
+    if price_cents is None:
+        return None
+    if price_cents < config.MIN_PRICE_CENTS or price_cents > config.MAX_PRICE_CENTS:
+        return None
+    if _side_spread_too_wide(market, side, price_cents):
+        return None
+
+    implied = break_even_prob(price_cents)
+    adjusted_true = _shrink_probability(true_prob, implied)
+    edge = adjusted_true - implied
+    if edge < config.EDGE_THRESHOLD:
+        return None
+
+    return {
+        "ticker": market["ticker"],
+        "side": side,
+        "price_cents": price_cents,
+        "true_prob": adjusted_true,
+        "raw_true_prob": true_prob,
+        "edge": edge,
+        "team": team,
+        "title": title,
+    }
+
+
+def _coerce_price(value: object) -> int | None:
+    try:
+        price = int(value)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or price >= 100:
+        return None
+    return price
+
+
+def _team_probability(true_probs: dict[str, float], team_name: str) -> float | None:
+    for team, prob in true_probs.items():
+        if team.lower() == team_name.lower():
+            return float(prob)
+    return None
+
+
+def _market_matches_game(market_text: str, true_probs: dict[str, float]) -> bool:
+    odds_teams = {team.lower() for team in true_probs}
+    title_teams = parse_teams_from_text(market_text)
+    if not title_teams:
+        return False
+
+    mentioned_odds_teams = {team.lower() for team in title_teams} & odds_teams
+    if len(title_teams) >= 2:
+        return len(mentioned_odds_teams) >= 2
+    return len(mentioned_odds_teams) == 1
+
+
+def _side_spread_too_wide(market: dict, side: str, ask: int) -> bool:
+    bid_key = "yes_bid" if side == "yes" else "no_bid"
+    bid = _coerce_price(market.get(bid_key))
+    if bid is None:
+        return False
+    return ask - bid > config.MAX_SPREAD_CENTS
+
+
+def _shrink_probability(true_prob: float, implied_prob: float) -> float:
+    shrink = min(max(config.TRUE_PROB_SHRINK, 0), 1)
+    return true_prob * (1 - shrink) + implied_prob * shrink

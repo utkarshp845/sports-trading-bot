@@ -91,12 +91,46 @@ def log_trade(trade: dict, order_id: str):
     con.close()
 
 
+def get_or_create_daily_start_balance(current_balance: float) -> float:
+    con = sqlite3.connect(DB_PATH)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    row = con.execute("SELECT start_bal FROM daily_stats WHERE date=?", (today,)).fetchone()
+    if row and row[0] is not None:
+        con.close()
+        return float(row[0])
+
+    if row:
+        con.execute(
+            "UPDATE daily_stats SET start_bal=? WHERE date=?",
+            (current_balance, today),
+        )
+    else:
+        con.execute(
+            "INSERT INTO daily_stats(date, start_bal, trades) VALUES(?,?,0)",
+            (today, current_balance),
+        )
+    con.commit()
+    con.close()
+    return current_balance
+
+
 def today_trade_count() -> int:
     con = sqlite3.connect(DB_PATH)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     row = con.execute("SELECT trades FROM daily_stats WHERE date=?", (today,)).fetchone()
     con.close()
     return row[0] if row else 0
+
+
+def load_today_traded_tickers() -> set[str]:
+    con = sqlite3.connect(DB_PATH)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = con.execute(
+        "SELECT DISTINCT ticker FROM trades WHERE ts LIKE ?",
+        (f"{today}%",),
+    ).fetchall()
+    con.close()
+    return {row[0] for row in rows}
 
 
 # ── Daily loss guard ──────────────────────────────────────────────────────────
@@ -107,7 +141,7 @@ _session_start_balance: float | None = None
 def check_daily_loss(current_balance: float) -> bool:
     """Return True if we should halt trading for the day."""
     global _session_start_balance
-    if _session_start_balance is None:
+    if _session_start_balance is None or _session_start_balance <= 0:
         return False
     loss_pct = (_session_start_balance - current_balance) / _session_start_balance
     if loss_pct >= config.DAILY_LOSS_LIMIT:
@@ -167,6 +201,11 @@ def is_pregame(market: dict) -> bool:
 # ── Main scan loop ────────────────────────────────────────────────────────────
 
 def scan(kalshi: KalshiClient, odds: OddsFeed, bankroll: float):
+    trades_today = today_trade_count()
+    if trades_today >= config.MAX_TRADES_PER_DAY:
+        log.info("Daily trade cap reached (%d).", config.MAX_TRADES_PER_DAY)
+        return
+
     # 1. Fetch open Kalshi markets
     try:
         markets = kalshi.get_markets(status="open", limit=200)
@@ -203,6 +242,10 @@ def scan(kalshi: KalshiClient, odds: OddsFeed, bankroll: float):
 
     # 4. For each market, check for edge
     for market in nba_markets:
+        if trades_today >= config.MAX_TRADES_PER_DAY:
+            log.info("Daily trade cap reached (%d).", config.MAX_TRADES_PER_DAY)
+            return
+
         ticker = market["ticker"]
         if ticker in _traded_tickers:
             continue
@@ -251,13 +294,14 @@ def scan(kalshi: KalshiClient, odds: OddsFeed, bankroll: float):
             log.info("Order placed: %s", order_id)
             log_trade(signal, order_id)
             _traded_tickers.add(ticker)
+            trades_today += 1
             bankroll -= cost  # optimistic deduction; real balance updated next poll
         except Exception as e:
             log.error("Order failed for %s: %s", ticker, e)
 
 
 def run():
-    global _session_start_balance
+    global _session_start_balance, _traded_tickers
 
     log.info("=" * 60)
     log.info("Kalshi NBA Trading Bot starting")
@@ -268,18 +312,21 @@ def run():
     odds_feed = OddsFeed()
 
     balance = kalshi.get_balance()
-    _session_start_balance = balance
+    _session_start_balance = get_or_create_daily_start_balance(balance)
+    _traded_tickers = load_today_traded_tickers()
     log.info("Account balance: $%.2f", balance)
+    log.info("Daily start balance: $%.2f", _session_start_balance)
+    log.info("Already-traded tickers today: %d", len(_traded_tickers))
 
     while True:
         try:
             balance = kalshi.get_balance()
+            _session_start_balance = get_or_create_daily_start_balance(balance)
             log.info("Balance: $%.2f | trades today: %d", balance, today_trade_count())
 
             if check_daily_loss(balance):
                 log.info("Sleeping 1 hour before retry...")
                 time.sleep(3600)
-                _session_start_balance = kalshi.get_balance()
                 continue
 
             scan(kalshi, odds_feed, balance)

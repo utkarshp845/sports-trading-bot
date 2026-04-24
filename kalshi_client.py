@@ -12,6 +12,7 @@ class KalshiClient:
             base_url=config.KALSHI_BASE,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             timeout=15.0,
+            transport=httpx.HTTPTransport(retries=2),
         )
 
     # ── Account ──────────────────────────────────────────────────────────────
