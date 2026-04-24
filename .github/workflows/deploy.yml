@@ -40,8 +40,8 @@ jobs:
           ODDS_API_KEY=${{ secrets.ODDS_API_KEY }}
           ENVEOF
 
-            # Ensure pip is available then install deps
-            python3 -m ensurepip --upgrade 2>/dev/null || true
+            # Install pip via apt if missing, then install deps
+            sudo apt-get install -y -q python3-pip
             python3 -m pip install -q -r /home/ubuntu/trading-bot/requirements.txt
 
             # Install/update systemd service
