@@ -6,7 +6,7 @@ load_dotenv()
 KALSHI_API_KEY = os.getenv("KALSHI_API_KEY", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 
-KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 # Which sports to scan (The Odds API keys)
