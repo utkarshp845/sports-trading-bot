@@ -369,7 +369,7 @@ def run():
         balance = kalshi.get_balance()
     except Exception as e:
         log.critical("Cannot reach Kalshi API at startup: %s", e)
-        log.critical("Check that KALSHI_API_KEY is set correctly in .env")
+        log.critical("Check KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH in .env")
         raise SystemExit(1)
 
     _session_start_balance = get_or_create_daily_start_balance(balance)
