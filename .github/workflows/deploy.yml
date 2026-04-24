@@ -26,6 +26,9 @@ jobs:
             --exclude '.env' \
             --exclude 'trades.db' \
             --exclude '__pycache__' \
+            --exclude 'private_key.pem' \
+            --exclude 'logs/' \
+            --exclude 'reports/' \
             -e "ssh -i ~/.ssh/deploy_key" \
             ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/ubuntu/trading-bot/
 
@@ -51,7 +54,7 @@ jobs:
             set -e
             chmod 600 /home/ubuntu/trading-bot/private_key.pem
             sudo apt-get install -y -q python3-pip
-            python3 -m pip install -q -r /home/ubuntu/trading-bot/requirements.txt
+            python3 -m pip install -q --break-system-packages -r /home/ubuntu/trading-bot/requirements.txt
             sudo cp /home/ubuntu/trading-bot/trading-bot.service /etc/systemd/system/trading-bot.service
             sudo systemctl daemon-reload
             sudo systemctl enable trading-bot
