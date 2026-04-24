@@ -29,27 +29,33 @@ jobs:
             -e "ssh -i ~/.ssh/deploy_key" \
             ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/ubuntu/trading-bot/
 
-      - name: Install deps, write .env, restart service
+      - name: Write secrets to EC2
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          DEST: ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}
         run: |
-          ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          # Write files locally then scp — avoids heredoc-in-heredoc YAML issues
+          printf 'KALSHI_API_KEY_ID=%s\nKALSHI_PRIVATE_KEY_PATH=/home/ubuntu/trading-bot/private_key.pem\nODDS_API_KEY=%s\n' \
+            "$KALSHI_API_KEY_ID" "$ODDS_API_KEY" > /tmp/trading-bot.env
+
+          printf '%s' "$KALSHI_PRIVATE_KEY" > /tmp/kalshi_private_key.pem
+
+          scp -i ~/.ssh/deploy_key /tmp/trading-bot.env        "$DEST":/home/ubuntu/trading-bot/.env
+          scp -i ~/.ssh/deploy_key /tmp/kalshi_private_key.pem "$DEST":/home/ubuntu/trading-bot/private_key.pem
+
+      - name: Install deps and restart service
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} '
             set -e
-
-            # Write .env (overwrite on every deploy)
-            cat > /home/ubuntu/trading-bot/.env << ENVEOF
-          KALSHI_API_KEY=${{ secrets.KALSHI_API_KEY }}
-          ODDS_API_KEY=${{ secrets.ODDS_API_KEY }}
-          ENVEOF
-
-            # Install pip via apt if missing, then install deps
+            chmod 600 /home/ubuntu/trading-bot/private_key.pem
             sudo apt-get install -y -q python3-pip
             python3 -m pip install -q -r /home/ubuntu/trading-bot/requirements.txt
-
-            # Install/update systemd service
             sudo cp /home/ubuntu/trading-bot/trading-bot.service /etc/systemd/system/trading-bot.service
             sudo systemctl daemon-reload
             sudo systemctl enable trading-bot
             sudo systemctl restart trading-bot
-
-            echo "Service status:"
+            echo "=== Service status ==="
             sudo systemctl status trading-bot --no-pager -l
-          EOF
+          '
