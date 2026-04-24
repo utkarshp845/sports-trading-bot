@@ -11,24 +11,46 @@ Env vars required (via .env file or shell):
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 import logging
+import logging.handlers
 from datetime import datetime, timezone
 
 import config
 from kalshi_client import KalshiClient
 from odds_feed import OddsFeed
 import strategy
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+import report as report_mod
 
 DB_PATH = "trades.db"
+LOG_DIR = "logs"
+LOG_PATH = os.path.join(LOG_DIR, "trading-bot.log")
+
+
+def _setup_logging() -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    fmt = "%(asctime)s  %(levelname)-7s  %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(fmt, datefmt)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=7, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(console)
+    root.addHandler(file_handler)
+    return logging.getLogger(__name__)
+
+
+log = _setup_logging()
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -55,9 +77,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS daily_stats (
             date        TEXT PRIMARY KEY,
             start_bal   REAL,
+            end_bal     REAL,
             trades      INTEGER DEFAULT 0
         )
     """)
+    # migrate older DB that lacks end_bal
+    try:
+        con.execute("ALTER TABLE daily_stats ADD COLUMN end_bal REAL")
+    except Exception:
+        pass
     con.commit()
     con.close()
 
@@ -112,6 +140,17 @@ def get_or_create_daily_start_balance(current_balance: float) -> float:
     con.commit()
     con.close()
     return current_balance
+
+
+def update_daily_end_balance(current_balance: float) -> None:
+    con = sqlite3.connect(DB_PATH)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    con.execute(
+        "UPDATE daily_stats SET end_bal=? WHERE date=?",
+        (current_balance, today),
+    )
+    con.commit()
+    con.close()
 
 
 def today_trade_count() -> int:
@@ -300,11 +339,26 @@ def scan(kalshi: KalshiClient, odds: OddsFeed, bankroll: float):
             log.error("Order failed for %s: %s", ticker, e)
 
 
+def _maybe_generate_report(current_date: str, balance: float) -> str:
+    """Generate and save a daily report; return today's date string."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today != current_date:
+        # Day rolled over — finalize yesterday's report
+        update_daily_end_balance(balance)
+        try:
+            path = report_mod.save_daily_report(current_date)
+            log.info("Daily report saved: %s", path)
+        except Exception as e:
+            log.error("Failed to save daily report: %s", e)
+    return today
+
+
 def run():
     global _session_start_balance, _traded_tickers
 
     log.info("=" * 60)
     log.info("Kalshi NBA Trading Bot starting")
+    log.info("Logs: %s", LOG_PATH)
     log.info("=" * 60)
 
     init_db()
@@ -314,6 +368,7 @@ def run():
     balance = kalshi.get_balance()
     _session_start_balance = get_or_create_daily_start_balance(balance)
     _traded_tickers = load_today_traded_tickers()
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log.info("Account balance: $%.2f", balance)
     log.info("Daily start balance: $%.2f", _session_start_balance)
     log.info("Already-traded tickers today: %d", len(_traded_tickers))
@@ -322,6 +377,8 @@ def run():
         try:
             balance = kalshi.get_balance()
             _session_start_balance = get_or_create_daily_start_balance(balance)
+            update_daily_end_balance(balance)
+            current_date = _maybe_generate_report(current_date, balance)
             log.info("Balance: $%.2f | trades today: %d", balance, today_trade_count())
 
             if check_daily_loss(balance):
@@ -332,7 +389,14 @@ def run():
             scan(kalshi, odds_feed, balance)
 
         except KeyboardInterrupt:
-            log.info("Shutting down.")
+            log.info("Shutting down — generating daily report...")
+            update_daily_end_balance(balance)
+            try:
+                path = report_mod.save_daily_report(current_date)
+                log.info("Daily report saved: %s", path)
+                print(report_mod.generate_daily_report(current_date))
+            except Exception as e:
+                log.error("Failed to save daily report: %s", e)
             break
         except Exception as e:
             log.exception("Unexpected error: %s", e)
