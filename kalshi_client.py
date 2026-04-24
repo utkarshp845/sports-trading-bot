@@ -1,16 +1,51 @@
+import base64
+import time
 import uuid
+
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
 import config
 
 
+class _KalshiAuth(httpx.Auth):
+    """RSA-PSS request signing for the Kalshi elections API."""
+
+    def __init__(self, key_id: str, private_key_path: str):
+        if not key_id:
+            raise ValueError("KALSHI_API_KEY_ID not set")
+        if not private_key_path:
+            raise ValueError("KALSHI_PRIVATE_KEY_PATH not set")
+        with open(private_key_path, "rb") as f:
+            self._private_key = serialization.load_pem_private_key(f.read(), password=None)
+        self._key_id = key_id
+
+    def auth_flow(self, request: httpx.Request):
+        ts = str(int(time.time() * 1000))
+        path = request.url.path  # no query string
+        message = f"{ts}{request.method}{path}".encode()
+        signature = self._private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        request.headers["KALSHI-ACCESS-KEY"] = self._key_id
+        request.headers["KALSHI-ACCESS-TIMESTAMP"] = ts
+        request.headers["KALSHI-ACCESS-SIGNATURE"] = base64.b64encode(signature).decode()
+        yield request
+
+
 class KalshiClient:
-    def __init__(self, api_key: str = ""):
-        key = api_key or config.KALSHI_API_KEY
-        if not key:
-            raise ValueError("KALSHI_API_KEY not set")
+    def __init__(self):
+        auth = _KalshiAuth(config.KALSHI_API_KEY_ID, config.KALSHI_PRIVATE_KEY_PATH)
         self._http = httpx.Client(
             base_url=config.KALSHI_BASE,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            auth=auth,
+            headers={"Content-Type": "application/json"},
             timeout=15.0,
             transport=httpx.HTTPTransport(retries=2),
         )
@@ -51,11 +86,10 @@ class KalshiClient:
     def place_order(
         self,
         ticker: str,
-        side: str,       # "yes" or "no"
+        side: str,
         contracts: int,
-        price_cents: int,  # 1–99
+        price_cents: int,
     ) -> dict:
-        """Place a limit buy order. price_cents is the price for `side`."""
         if side == "yes":
             yes_price, no_price = price_cents, 100 - price_cents
         else:
